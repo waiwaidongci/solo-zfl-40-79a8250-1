@@ -156,6 +156,7 @@ export class CyanotypeStore {
     this.filePath = filePath;
     this.db = null;
     this._saveChain = Promise.resolve();
+    this._mutationChain = Promise.resolve();
     this._tmpSeq = 0;
   }
 
@@ -263,24 +264,44 @@ export class CyanotypeStore {
     }
   }
 
+  // 变更串行锁:同一时刻只允许一个"修改内存 + 落盘"组合操作,
+  // 这样落盘失败时的整体回滚不会误伤并发成功的其他变更。
+  _enqueue(fn) {
+    const run = this._mutationChain.then(fn);
+    this._mutationChain = run.catch(() => {});
+    return run;
+  }
+
   // 幂等执行:同一 idemKey 重复提交直接返回首次结果,不重复落记录;
   // 同一键提交不同内容视为冲突。校验失败不会占用键。
+  // 落盘失败时整体回滚(内存记录、幂等键、序号),并尽力把文件恢复为原内容。
   async _idempotent(idemKey, scope, payload, mutate) {
-    if (idemKey) {
-      const hit = this.db.idempotency[idemKey];
-      if (hit) {
-        if (hit.scope !== scope || hit.payload !== payload) {
-          fail(409, "idempotency_key_reused", "同一请求键提交了不同内容,已拒绝");
+    return this._enqueue(async () => {
+      if (idemKey) {
+        const hit = this.db.idempotency[idemKey];
+        if (hit) {
+          if (hit.scope !== scope || hit.payload !== payload) {
+            fail(409, "idempotency_key_reused", "同一请求键提交了不同内容,已拒绝");
+          }
+          return { result: structuredClone(hit.response), replayed: true };
         }
-        return { result: structuredClone(hit.response), replayed: true };
       }
-    }
-    const result = mutate();
-    if (idemKey) {
-      this.db.idempotency[idemKey] = { scope, payload, response: structuredClone(result) };
-    }
-    await this._persist();
-    return { result: structuredClone(result), replayed: false };
+      const snapshot = structuredClone(this.db);
+      let result;
+      try {
+        result = mutate();
+        if (idemKey) {
+          this.db.idempotency[idemKey] = { scope, payload, response: structuredClone(result) };
+        }
+        await this._persist();
+      } catch (error) {
+        this.db = snapshot;
+        // 尽力把文件恢复为回滚后的内容(覆盖 rename 已成功但目录 fsync 失败的边角情况)
+        await this._persist().catch(() => {});
+        throw error;
+      }
+      return { result: structuredClone(result), replayed: false };
+    });
   }
 
   _findItem(ref) {
