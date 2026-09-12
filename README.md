@@ -14,8 +14,10 @@ npm start          # http://localhost:3040
 ## 测试
 
 ```bash
-npm test           # node:test,覆盖状态机、盒位冲突、幂等重放、重启恢复、异常输入与并发更新
+npm test           # node --test,自动发现 test/ 下全部用例(兼容新旧 Node;不要写成 node --test test/,新版 Node 会把目录当成模块)
 ```
+
+覆盖状态机、盒位冲突、幂等重放、重启恢复、异常输入、并发更新,以及测试命令本身的回归检查(命令漂移、失败时退出码非零)。
 
 ## 业务规则
 
