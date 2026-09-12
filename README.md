@@ -9,7 +9,13 @@
 npm start          # http://localhost:3040
 ```
 
-数据保存在 `data/cyanotype-negative-room.json`(原子写盘,重启后自动恢复,旧格式数据自动迁移)。
+数据保存在 `data/cyanotype-negative-room.json`。启动时会真实写入探针文件确认数据目录可写,不可写则拒绝启动;落盘采用临时文件 + fsync + rename + 目录 fsync,断电或中断不会留下半截数据,重启时自动清理残留临时文件并迁移旧格式数据。
+
+## 运行保障
+
+- **健康检查**:`GET /api/health` 返回版本、监听地址、数据库可读状态与未关闭工单数;数据库不可读时返回 503 与 `degraded`。
+- **优雅退出**:收到 `SIGTERM`/`SIGINT` 后停止接收新连接,等待在途请求与排队写入全部落盘后退出(超时 5 秒强制退出)。
+- **请求日志**:每行带请求编号(响应头 `X-Request-Id` 一致)、方法、路径、响应状态与耗时;仅记录 `to`/`box`/`expectedVersion`/`count`/`status` 等操作类字段,复核人、结论、处理结果、备注等敏感内容一律不落地,查询串也不记录。
 
 ## 测试
 
@@ -44,5 +50,6 @@ npm test           # node --test,自动发现 test/ 下全部用例(兼容新旧
 | GET | `/api/reviews` | 工单列表(支持 status/box/item/overdue 筛选,含逾期标记) |
 | POST | `/api/reviews/:id/close` | 关闭工单 `{ resolution, expectedVersion? }` |
 | GET | `/api/stats` | 状态/缺陷/复晒/工单统计 |
+| GET | `/api/health` | 健康检查(版本/监听地址/数据库可读/未关闭工单数) |
 
 错误统一返回 `{ "error": 错误码, "message": 描述 }`,状态码语义:400 输入非法 / 404 不存在 / 405 方法不允许 / 409 业务冲突(跳步、退回、盒位占用、版本冲突、幂等键重用)/ 413 请求体过大。

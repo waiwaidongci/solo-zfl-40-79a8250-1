@@ -1,6 +1,6 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, rename, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { dirname } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 // 底片状态机:只允许依次推进,退回与跳步一律拒绝
@@ -160,32 +160,107 @@ export class CyanotypeStore {
   }
 
   async load() {
+    const dir = dirname(this.filePath);
+    try {
+      await mkdir(dir, { recursive: true });
+    } catch (error) {
+      fail(500, "db_not_writable", `数据目录不可写,请先检查目录权限: ${error.message}`);
+    }
+    await this._cleanStaleTmp(dir);
     if (!existsSync(this.filePath)) {
       this.db = emptyDb();
-      await mkdir(dirname(this.filePath), { recursive: true });
-      await this._persist();
-      return this;
+      try {
+        await this._persist();
+      } catch (error) {
+        fail(500, "db_not_writable", `数据目录不可写,请先检查目录权限: ${error.message}`);
+      }
+    } else {
+      let raw;
+      try {
+        raw = JSON.parse(await readFile(this.filePath, "utf8"));
+      } catch (error) {
+        fail(500, "db_corrupted", `数据文件损坏,无法恢复: ${error.message}`);
+      }
+      this.db = normalizeDb(raw);
     }
-    let raw;
-    try {
-      raw = JSON.parse(await readFile(this.filePath, "utf8"));
-    } catch (error) {
-      fail(500, "db_corrupted", `数据文件损坏,无法恢复: ${error.message}`);
-    }
-    this.db = normalizeDb(raw);
+    await this._probeWritable();
     return this;
   }
 
-  // 原子写盘(临时文件 + rename),并通过队列串行化,避免并发写坏文件
+  // 启动时确认数据目录可写:真实写入一个探针文件再删除
+  async _probeWritable() {
+    const probe = `${this.filePath}.probe-${process.pid}`;
+    try {
+      const fh = await open(probe, "w");
+      try {
+        await fh.sync();
+      } finally {
+        await fh.close();
+      }
+      await unlink(probe);
+    } catch (error) {
+      fail(500, "db_not_writable", `数据目录不可写,请先检查目录权限: ${error.message}`);
+    }
+  }
+
+  // 清理上次中断可能残留的临时文件
+  async _cleanStaleTmp(dir) {
+    const prefix = basename(this.filePath) + ".";
+    let names;
+    try {
+      names = await readdir(dir);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      if (name.startsWith(prefix) && name.endsWith(".tmp")) {
+        await unlink(join(dir, name)).catch(() => {});
+      }
+    }
+  }
+
+  // 原子且持久地落盘:写临时文件 → fsync → rename → 目录 fsync。
+  // 任何一步失败都不会留下半截数据;通过队列串行化,避免并发写坏文件。
+  async _persistNow() {
+    const dir = dirname(this.filePath);
+    await mkdir(dir, { recursive: true });
+    const tmp = `${this.filePath}.${process.pid}.${++this._tmpSeq}.tmp`;
+    const fh = await open(tmp, "w");
+    try {
+      await fh.writeFile(JSON.stringify(this.db, null, 2));
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
+    await rename(tmp, this.filePath);
+    const dh = await open(dir, "r");
+    try {
+      await dh.sync();
+    } finally {
+      await dh.close();
+    }
+  }
+
   _persist() {
-    const run = this._saveChain.then(async () => {
-      await mkdir(dirname(this.filePath), { recursive: true });
-      const tmp = `${this.filePath}.${process.pid}.${++this._tmpSeq}.tmp`;
-      await writeFile(tmp, JSON.stringify(this.db, null, 2));
-      await rename(tmp, this.filePath);
-    });
+    const run = this._saveChain.then(() => this._persistNow());
     this._saveChain = run.catch(() => {});
     return run;
+  }
+
+  // 等待所有在途写入落盘(优雅退出用)
+  async drain() {
+    await this._saveChain;
+  }
+
+  // 健康检查:数据库文件是否可读(真实读取,而非仅查权限位)
+  async healthCheck() {
+    if (!this.db) return { readable: false, error: "数据库未加载" };
+    try {
+      await readFile(this.filePath, "utf8");
+      return { readable: true };
+    } catch (error) {
+      return { readable: false, error: error.message };
+    }
   }
 
   // 幂等执行:同一 idemKey 重复提交直接返回首次结果,不重复落记录;
