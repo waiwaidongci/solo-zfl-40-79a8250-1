@@ -49,6 +49,15 @@ export function page() {
         <label>备注</label><input name="note" maxlength="300">
         <button type="submit">提交记录</button>
       </form>
+      <form id="reviewForm" style="margin-top:14px">
+        <h2>发起复核工单</h2>
+        <label>选择底片(仅待入盒)</label><select name="id" id="reviewItemSelect" required></select>
+        <label>复核人 *</label><input name="reviewer" required maxlength="120">
+        <label>缺陷结论 *</label><input name="conclusion" required maxlength="120">
+        <label>整改要求 *</label><input name="requirement" required maxlength="200">
+        <label>截止时间 *</label><input name="deadline" type="date" required>
+        <button type="submit">发起复核</button>
+      </form>
     </section>
     <section>
       <div class="stats" id="stats"></div>
@@ -60,15 +69,22 @@ export function page() {
         <input id="fQ" placeholder="搜索关键词">
       </div>
       <div class="panel"><h2>底片列表</h2><div class="grid" id="cards"></div></div>
+      <div class="panel" style="margin-top:14px">
+        <h2>复核工单</h2>
+        <div class="toolbar"><select id="fReview"><option value="">全部工单</option><option>未关闭</option><option>已关闭</option><option value="逾期">仅逾期</option></select></div>
+        <div class="grid" id="reviews"></div>
+      </div>
     </section>
   </main>
   <div id="toast"></div>
   <script>
     var STAGES = ["待曝光","冲洗中","待入盒","已交付"];
-    var items = [], batches = [], stats = null;
+    var items = [], batches = [], stats = null, reviews = [];
     var batchFormKey = crypto.randomUUID();
     var stepFormKey = crypto.randomUUID();
+    var reviewFormKey = crypto.randomUUID();
     var advanceKeys = {};
+    var closeKeys = {};
 
     function esc(s) {
       return String(s == null ? "" : s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");
@@ -103,8 +119,8 @@ export function page() {
       if (fBox) params.set("box", fBox);
       if (fDefect) params.set("defect", fDefect);
       if (fQ) params.set("q", fQ);
-      var results = await Promise.all([api("/api/items?" + params.toString()), api("/api/batches"), api("/api/stats")]);
-      items = results[0]; batches = results[1]; stats = results[2];
+      var results = await Promise.all([api("/api/items?" + params.toString()), api("/api/batches"), api("/api/stats"), api("/api/reviews")]);
+      items = results[0]; batches = results[1]; stats = results[2]; reviews = results[3];
       render();
     }
 
@@ -112,6 +128,8 @@ export function page() {
       var statsHtml = STAGES.map(function(s){ return '<div class="stat"><span>' + s + '</span><strong>' + (stats.byStatus[s] || 0) + '</strong></div>'; }).join("");
       statsHtml += '<div class="stat"><span>缺陷底片</span><strong class="warn">' + stats.withDefect + '</strong></div>';
       statsHtml += '<div class="stat"><span>复晒总次数</span><strong>' + stats.reexposeTotal + '</strong></div>';
+      statsHtml += '<div class="stat"><span>未关闭工单</span><strong>' + stats.reviews.open + '</strong></div>';
+      statsHtml += '<div class="stat"><span>逾期工单</span><strong class="warn">' + stats.reviews.overdue + '</strong></div>';
       document.getElementById("stats").innerHTML = statsHtml;
 
       var batchSel = document.getElementById("fBatch");
@@ -127,10 +145,57 @@ export function page() {
         return '<option value="' + esc(i.id) + '"' + (i.id === keepItem ? ' selected' : '') + '>' + esc(i.code) + ' · ' + esc(i.status) + '</option>';
       }).join("") : '<option value="">(暂无未交付底片)</option>';
 
+      var reviewSel = document.getElementById("reviewItemSelect");
+      var keepReview = reviewSel.value;
+      var boxed = items.filter(function(i){ return i.status === "待入盒"; });
+      reviewSel.innerHTML = boxed.length ? boxed.map(function(i){
+        return '<option value="' + esc(i.id) + '"' + (i.id === keepReview ? ' selected' : '') + '>' + esc(i.code) + ' · ' + esc(i.box || "未入盒") + '</option>';
+      }).join("") : '<option value="">(暂无待入盒底片)</option>';
+
       document.getElementById("cards").innerHTML = items.length ? items.map(cardHtml).join("") : '<div class="meta">暂无符合条件的底片</div>';
       Array.prototype.forEach.call(document.querySelectorAll("[data-advance]"), function(btn){
         btn.onclick = function(){ advance(btn.getAttribute("data-advance")); };
       });
+
+      var rf = document.getElementById("fReview").value;
+      var visibleReviews = reviews.filter(function(r){
+        if (rf === "逾期") return r.overdue;
+        return !rf || r.status === rf;
+      });
+      document.getElementById("reviews").innerHTML = visibleReviews.length ? visibleReviews.map(reviewHtml).join("") : '<div class="meta">暂无符合条件的工单</div>';
+      Array.prototype.forEach.call(document.querySelectorAll("[data-close]"), function(btn){
+        btn.onclick = function(){ closeReview(btn.getAttribute("data-close")); };
+      });
+    }
+
+    function reviewHtml(r) {
+      var h = '<article class="card"><div class="row"><h3 style="margin:0">' + esc(r.code) + '</h3><span class="pill">' + esc(r.status) + '</span></div>';
+      h += '<div class="meta">底片 ' + esc(r.itemCode) + ' · 盒位 ' + esc(r.box) + '</div>';
+      h += '<div class="meta">复核人 ' + esc(r.reviewer) + ' · 截止 ' + esc(String(r.deadline).slice(0, 10)) + '</div>';
+      if (r.overdue) h += '<div class="warn">已逾期,请尽快处理</div>';
+      h += '<div>缺陷结论:' + esc(r.conclusion) + '</div>';
+      h += '<div>整改要求:' + esc(r.requirement) + '</div>';
+      if (r.status === "未关闭") {
+        h += '<button data-close="' + esc(r.id) + '">关闭工单</button>';
+      } else {
+        h += '<div class="meta">处理结果:' + esc(r.resolution) + '</div>';
+      }
+      return h + '</article>';
+    }
+
+    async function closeReview(id) {
+      var resolution = prompt("请输入处理结果(必填)");
+      if (resolution === null) return;
+      if (!resolution.trim()) { toast("处理结果不能为空", false); return; }
+      closeKeys[id] = closeKeys[id] || crypto.randomUUID();
+      try {
+        await jsonPost("/api/reviews/" + encodeURIComponent(id) + "/close", { resolution: resolution }, closeKeys[id]);
+        delete closeKeys[id];
+        toast("工单已关闭", true);
+      } catch (e) {
+        toast(e.message, false);
+      }
+      await load();
     }
 
     function cardHtml(item) {
@@ -142,6 +207,8 @@ export function page() {
       if (item.plateSize) h += '<div class="meta">玻璃板 ' + esc(item.plateSize) + '</div>';
       h += '<div class="meta">盒位 ' + (item.box ? esc(item.box) : "未入盒") + ' · 复晒 ' + item.reexposeCount + ' 次 · 版本 v' + item.version + '</div>';
       if (item.defect) h += '<div class="warn">缺陷:' + esc(item.defect) + '</div>';
+      var openReview = reviews.find(function(r){ return r.itemId === item.id && r.status === "未关闭"; });
+      if (openReview) h += '<div class="warn">复核工单 ' + esc(openReview.code) + (openReview.overdue ? "(已逾期)" : "") + ' 未关闭,暂不能交付</div>';
       var steps = (item.steps || []).slice(-3).map(function(s){
         var parts = '[' + esc(s.stage || "") + '] ' + esc(s.step);
         if (s.reexpose) parts += '(复晒)';
@@ -223,7 +290,29 @@ export function page() {
       await load();
     };
 
+    document.getElementById("reviewForm").onsubmit = async function(ev) {
+      ev.preventDefault();
+      var form = ev.target;
+      var id = document.getElementById("reviewItemSelect").value;
+      if (!id) { toast("请先选择待入盒底片", false); return; }
+      var btn = form.querySelector("button");
+      btn.disabled = true;
+      var fd = new FormData(form);
+      var payload = { reviewer: fd.get("reviewer"), conclusion: fd.get("conclusion"), requirement: fd.get("requirement"), deadline: fd.get("deadline") };
+      try {
+        var r = await jsonPost("/api/items/" + encodeURIComponent(id) + "/reviews", payload, reviewFormKey);
+        toast("复核工单 " + r.code + " 已发起", true);
+        form.reset();
+        reviewFormKey = crypto.randomUUID();
+      } catch (e) {
+        toast(e.message, false);
+      }
+      btn.disabled = false;
+      await load();
+    };
+
     ["fStatus","fBatch"].forEach(function(id){ document.getElementById(id).onchange = function(){ load().catch(function(e){ toast(e.message, false); }); }; });
+    document.getElementById("fReview").onchange = render;
     ["fBox","fDefect","fQ"].forEach(function(id){ document.getElementById(id).oninput = function(){ load().catch(function(e){ toast(e.message, false); }); }; });
     document.getElementById("reload").onclick = function(){ load().catch(function(e){ toast(e.message, false); }); };
 

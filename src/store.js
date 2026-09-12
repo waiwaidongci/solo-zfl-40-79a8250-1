@@ -6,6 +6,9 @@ import { randomUUID } from "node:crypto";
 // 底片状态机:只允许依次推进,退回与跳步一律拒绝
 export const STAGES = ["待曝光", "冲洗中", "待入盒", "已交付"];
 
+// 复核工单状态
+export const REVIEW_STATUSES = ["未关闭", "已关闭"];
+
 export class StoreError extends Error {
   constructor(status, code, message) {
     super(message);
@@ -37,7 +40,41 @@ function looseString(value) {
 }
 
 function emptyDb() {
-  return { items: [], batches: [], idempotency: {}, seq: 0 };
+  return { items: [], batches: [], reviews: [], idempotency: {}, seq: 0, reviewSeq: 0 };
+}
+
+function normalizeReview(raw, index) {
+  const r = raw && typeof raw === "object" ? raw : {};
+  return {
+    id: typeof r.id === "string" && r.id ? r.id : `review-legacy-${index + 1}`,
+    code: typeof r.code === "string" && r.code ? r.code : `RV-LEGACY-${index + 1}`,
+    itemId: typeof r.itemId === "string" ? r.itemId : "",
+    itemCode: typeof r.itemCode === "string" ? r.itemCode : "",
+    box: looseString(r.box),
+    reviewer: looseString(r.reviewer),
+    conclusion: looseString(r.conclusion),
+    requirement: looseString(r.requirement),
+    deadline: looseString(r.deadline),
+    status: REVIEW_STATUSES.includes(r.status) ? r.status : "未关闭",
+    resolution: looseString(r.resolution),
+    createdAt: typeof r.createdAt === "string" ? r.createdAt : "",
+    closedAt: typeof r.closedAt === "string" ? r.closedAt : "",
+    version: Number.isInteger(r.version) && r.version >= 1 ? r.version : 1,
+  };
+}
+
+// 截止时间:支持 YYYY-MM-DD(按当日结束计)或完整 ISO 时间
+function parseDeadline(value) {
+  const v = reqString(value, "截止时间", 40);
+  const normalized = /^\d{4}-\d{2}-\d{2}$/.test(v) ? `${v}T23:59:59.999Z` : v;
+  if (Number.isNaN(new Date(normalized).getTime())) {
+    fail(400, "invalid_input", `截止时间「${v}」不是合法日期`);
+  }
+  return normalized;
+}
+
+function isOverdue(review, now) {
+  return review.status === "未关闭" && new Date(review.deadline).getTime() < now;
 }
 
 function normalizeItem(raw, index) {
@@ -65,13 +102,19 @@ function normalizeDb(raw) {
   const db = {
     items: Array.isArray(raw?.items) ? raw.items.map(normalizeItem) : [],
     batches: Array.isArray(raw?.batches) ? raw.batches.filter(b => b && typeof b === "object") : [],
+    reviews: Array.isArray(raw?.reviews) ? raw.reviews.map(normalizeReview) : [],
     idempotency: raw?.idempotency && typeof raw.idempotency === "object" && !Array.isArray(raw.idempotency) ? raw.idempotency : {},
     seq: Number.isInteger(raw?.seq) && raw.seq >= 0 ? raw.seq : 0,
+    reviewSeq: Number.isInteger(raw?.reviewSeq) && raw.reviewSeq >= 0 ? raw.reviewSeq : 0,
   };
   // 旧数据迁移:序号只从批次编号恢复(底片编号形如 PC-0001-02,尾号会虚增序号)
   for (const batch of db.batches) {
     const m = /^PC-(\d+)$/.exec(typeof batch.code === "string" ? batch.code : "");
     if (m) db.seq = Math.max(db.seq, Number(m[1]));
+  }
+  for (const review of db.reviews) {
+    const m = /^RV-(\d+)$/.exec(typeof review.code === "string" ? review.code : "");
+    if (m) db.reviewSeq = Math.max(db.reviewSeq, Number(m[1]));
   }
   return db;
 }
@@ -207,6 +250,10 @@ export class CyanotypeStore {
         const holder = this.db.items.find(x => x.id !== item.id && x.box === box && x.status !== "已交付");
         if (holder) fail(409, "box_occupied", `盒位「${box}」已被未交付底片 ${holder.code} 占用`);
       }
+      if (to === "已交付") {
+        const open = this.db.reviews.find(r => r.itemId === item.id && r.status === "未关闭");
+        if (open) fail(409, "open_review", `存在未关闭复核工单 ${open.code},不能交付`);
+      }
       const now = new Date().toISOString();
       const from = item.status;
       item.status = to;
@@ -243,6 +290,94 @@ export class CyanotypeStore {
     return structuredClone(this._findItem(ref));
   }
 
+  _findReview(ref) {
+    const review = this.db.reviews.find(r => r.id === ref || r.code === ref);
+    if (!review) fail(404, "review_not_found", `找不到复核工单 ${ref}`);
+    return review;
+  }
+
+  // 发起复核工单:仅待入盒底片可发起;同一盒位同时只能有一张未关闭工单
+  async createReview(itemRef, input = {}, idemKey) {
+    const reviewer = reqString(input.reviewer, "复核人");
+    const conclusion = reqString(input.conclusion, "缺陷结论");
+    const requirement = reqString(input.requirement, "整改要求");
+    const deadline = parseDeadline(input.deadline);
+    return this._idempotent(idemKey, "createReview", JSON.stringify({ itemRef, reviewer, conclusion, requirement, deadline }), () => {
+      const item = this._findItem(itemRef);
+      if (item.status !== "待入盒") {
+        fail(409, "invalid_state", `底片当前状态为「${item.status}」,仅待入盒的底片可以发起复核`);
+      }
+      if (!item.box) fail(409, "invalid_state", "底片尚未指定盒位,无法发起复核");
+      const clash = this.db.reviews.find(r => r.status === "未关闭" && r.box === item.box);
+      if (clash) fail(409, "box_review_exists", `盒位「${item.box}」已存在未关闭工单 ${clash.code}`);
+      const now = new Date().toISOString();
+      this.db.reviewSeq += 1;
+      const review = {
+        id: randomUUID(),
+        code: "RV-" + String(this.db.reviewSeq).padStart(4, "0"),
+        itemId: item.id,
+        itemCode: item.code,
+        box: item.box,
+        reviewer,
+        conclusion,
+        requirement,
+        deadline,
+        status: "未关闭",
+        resolution: "",
+        createdAt: now,
+        closedAt: "",
+        version: 1,
+      };
+      this.db.reviews.unshift(review);
+      item.logs.push({ at: now, step: "复核", note: `发起复核工单 ${review.code}(复核人:${reviewer})` });
+      item.version += 1;
+      return review;
+    });
+  }
+
+  // 关闭工单:必须填写处理结果;重复关闭拒绝
+  async closeReview(reviewRef, input = {}, idemKey) {
+    const resolution = reqString(input.resolution, "处理结果", 300);
+    const expectedVersion = input.expectedVersion;
+    if (expectedVersion !== undefined && !Number.isInteger(expectedVersion)) {
+      fail(400, "invalid_input", "expectedVersion 必须是整数");
+    }
+    return this._idempotent(idemKey, "closeReview", JSON.stringify({ reviewRef, resolution, expectedVersion }), () => {
+      const review = this._findReview(reviewRef);
+      if (review.status === "已关闭") fail(409, "invalid_state", `工单 ${review.code} 已关闭,请勿重复操作`);
+      if (expectedVersion !== undefined && review.version !== expectedVersion) {
+        fail(409, "version_conflict", `工单已被他人更新(当前版本 ${review.version}),请刷新后重试`);
+      }
+      const now = new Date().toISOString();
+      review.status = "已关闭";
+      review.resolution = resolution;
+      review.closedAt = now;
+      review.version += 1;
+      const item = this.db.items.find(i => i.id === review.itemId);
+      if (item) {
+        item.logs.push({ at: now, step: "复核关闭", note: `${review.code}:${resolution}` });
+        item.version += 1;
+      }
+      return review;
+    });
+  }
+
+  listReviews(filter = {}) {
+    const { status, box, item, overdue } = filter;
+    if (status && !REVIEW_STATUSES.includes(status)) fail(400, "invalid_filter", `未知工单状态「${status}」`);
+    if (overdue !== undefined && overdue !== "true" && overdue !== "false") {
+      fail(400, "invalid_filter", "overdue 只支持 true 或 false");
+    }
+    const now = Date.now();
+    let reviews = this.db.reviews.map(r => ({ ...r, overdue: isOverdue(r, now) }));
+    if (status) reviews = reviews.filter(r => r.status === status);
+    if (box) reviews = reviews.filter(r => r.box === box);
+    if (item) reviews = reviews.filter(r => r.itemId === item || r.itemCode === item);
+    if (overdue === "true") reviews = reviews.filter(r => r.overdue);
+    if (overdue === "false") reviews = reviews.filter(r => !r.overdue);
+    return structuredClone(reviews);
+  }
+
   listItems(filter = {}) {
     const { status, batch, box, defect, q } = filter;
     if (status && !STAGES.includes(status)) fail(400, "invalid_filter", `未知状态「${status}」`);
@@ -272,6 +407,22 @@ export class CyanotypeStore {
       if (item.defect) withDefect += 1;
       reexposeTotal += item.reexposeCount;
     }
-    return { total: this.db.items.length, batches: this.db.batches.length, byStatus, withDefect, reexposeTotal };
+    const now = Date.now();
+    let reviewsOpen = 0;
+    let reviewsOverdue = 0;
+    for (const review of this.db.reviews) {
+      if (review.status === "未关闭") {
+        reviewsOpen += 1;
+        if (isOverdue(review, now)) reviewsOverdue += 1;
+      }
+    }
+    return {
+      total: this.db.items.length,
+      batches: this.db.batches.length,
+      byStatus,
+      withDefect,
+      reexposeTotal,
+      reviews: { open: reviewsOpen, overdue: reviewsOverdue },
+    };
   }
 }

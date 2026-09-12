@@ -86,6 +86,24 @@ export function createApp(store) {
       const { result, replayed } = await store.addStep(decodeRef(m[1]), input, idemKey(req, input));
       send(res, 201, result, replayed ? { "X-Idempotent-Replay": "true" } : {});
     }],
+    ["POST", /^\/api\/items\/([^/]+)\/reviews$/, async (req, res, url, m) => {
+      const input = await readJson(req);
+      const { result, replayed } = await store.createReview(decodeRef(m[1]), input, idemKey(req, input));
+      send(res, 201, result, replayed ? { "X-Idempotent-Replay": "true" } : {});
+    }],
+    ["GET", /^\/api\/reviews$/, (req, res, url) => {
+      const filter = {};
+      for (const key of ["status", "box", "item", "overdue"]) {
+        const v = url.searchParams.get(key);
+        if (v) filter[key] = v.trim();
+      }
+      send(res, 200, store.listReviews(filter));
+    }],
+    ["POST", /^\/api\/reviews\/([^/]+)\/close$/, async (req, res, url, m) => {
+      const input = await readJson(req);
+      const { result, replayed } = await store.closeReview(decodeRef(m[1]), input, idemKey(req, input));
+      send(res, 200, result, replayed ? { "X-Idempotent-Replay": "true" } : {});
+    }],
   ];
 
   return http.createServer(async (req, res) => {
