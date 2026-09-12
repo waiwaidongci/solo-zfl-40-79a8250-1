@@ -125,9 +125,9 @@ test("并发下失败回滚不误伤并发成功的变更", async () => {
     // 只让第一次落盘失败
     let calls = 0;
     const original = store._persistNow.bind(store);
-    store._persistNow = () => {
+    store._persistNow = (state) => {
       calls += 1;
-      return calls === 1 ? Promise.reject(new Error("injected")) : original();
+      return calls === 1 ? Promise.reject(new Error("injected")) : original(state);
     };
     const results = await Promise.allSettled([
       store.createBatch({ ...BATCH_1, chemicalBatch: "B-甲" }),

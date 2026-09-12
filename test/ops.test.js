@@ -214,9 +214,9 @@ test("优雅退出(进程内):停止接收新请求,在途写入完成后才退�
   try {
     // 注入慢速落盘,制造在途写入
     const original = store._persistNow.bind(store);
-    store._persistNow = async () => {
+    store._persistNow = async (state) => {
       await new Promise(r => setTimeout(r, 150));
-      return original();
+      return original(state);
     };
     const inflight = post(base, "/api/batches", { chemicalBatch: "B-1", exposure: "5分钟", waterSource: "泉水", count: 2 });
     await new Promise(r => setTimeout(r, 30)); // 确认请求已在途

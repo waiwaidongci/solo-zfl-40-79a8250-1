@@ -171,7 +171,7 @@ export class CyanotypeStore {
     if (!existsSync(this.filePath)) {
       this.db = emptyDb();
       try {
-        await this._persist();
+        await this._persist(this.db);
       } catch (error) {
         fail(500, "db_not_writable", `数据目录不可写,请先检查目录权限: ${error.message}`);
       }
@@ -222,13 +222,13 @@ export class CyanotypeStore {
 
   // 原子且持久地落盘:写临时文件 → fsync → rename → 目录 fsync。
   // 任何一步失败都不会留下半截数据;通过队列串行化,避免并发写坏文件。
-  async _persistNow() {
+  async _persistNow(state) {
     const dir = dirname(this.filePath);
     await mkdir(dir, { recursive: true });
     const tmp = `${this.filePath}.${process.pid}.${++this._tmpSeq}.tmp`;
     const fh = await open(tmp, "w");
     try {
-      await fh.writeFile(JSON.stringify(this.db, null, 2));
+      await fh.writeFile(JSON.stringify(state, null, 2));
       await fh.sync();
     } finally {
       await fh.close();
@@ -242,8 +242,8 @@ export class CyanotypeStore {
     }
   }
 
-  _persist() {
-    const run = this._saveChain.then(() => this._persistNow());
+  _persist(state) {
+    const run = this._saveChain.then(() => this._persistNow(state));
     this._saveChain = run.catch(() => {});
     return run;
   }
@@ -274,7 +274,8 @@ export class CyanotypeStore {
 
   // 幂等执行:同一 idemKey 重复提交直接返回首次结果,不重复落记录;
   // 同一键提交不同内容视为冲突。校验失败不会占用键。
-  // 落盘失败时整体回滚(内存记录、幂等键、序号),并尽力把文件恢复为原内容。
+  // 变更先落在暂存副本上,落盘成功后才提交到内存;读取只能看到已落盘的状态,
+  // 落盘失败时暂存副本直接丢弃,不会出现先出现再消失的记录。
   async _idempotent(idemKey, scope, payload, mutate) {
     return this._enqueue(async () => {
       if (idemKey) {
@@ -286,26 +287,27 @@ export class CyanotypeStore {
           return { result: structuredClone(hit.response), replayed: true };
         }
       }
-      const snapshot = structuredClone(this.db);
-      let result;
+      const staging = structuredClone(this.db);
+      // 业务校验失败直接抛出:暂存副本未提交,无任何副作用
+      const result = mutate(staging);
+      if (idemKey) {
+        staging.idempotency[idemKey] = { scope, payload, response: structuredClone(result) };
+      }
       try {
-        result = mutate();
-        if (idemKey) {
-          this.db.idempotency[idemKey] = { scope, payload, response: structuredClone(result) };
-        }
-        await this._persist();
+        await this._persist(staging);
       } catch (error) {
-        this.db = snapshot;
-        // 尽力把文件恢复为回滚后的内容(覆盖 rename 已成功但目录 fsync 失败的边角情况)
-        await this._persist().catch(() => {});
+        // 尽力把文件恢复为已提交内容(覆盖 rename 已成功但目录 fsync 失败的边角情况)
+        await this._persist(this.db).catch(() => {});
         throw error;
       }
+      // 落盘成功才提交,读取接口只能看到已成功落盘的状态
+      this.db = staging;
       return { result: structuredClone(result), replayed: false };
     });
   }
 
-  _findItem(ref) {
-    const item = this.db.items.find(x => x.id === ref || x.code === ref);
+  _findItem(db, ref) {
+    const item = db.items.find(x => x.id === ref || x.code === ref);
     if (!item) fail(404, "item_not_found", `找不到底片 ${ref}`);
     return item;
   }
@@ -320,10 +322,10 @@ export class CyanotypeStore {
     if (!Number.isInteger(count) || count < 1 || count > 100) {
       fail(400, "invalid_input", "拆分数量必须是 1-100 的整数");
     }
-    return this._idempotent(idemKey, "createBatch", JSON.stringify({ chemicalBatch, exposure, waterSource, plateSize, count }), () => {
+    return this._idempotent(idemKey, "createBatch", JSON.stringify({ chemicalBatch, exposure, waterSource, plateSize, count }), (db) => {
       const now = new Date().toISOString();
-      this.db.seq += 1;
-      const batchCode = "PC-" + String(this.db.seq).padStart(4, "0");
+      db.seq += 1;
+      const batchCode = "PC-" + String(db.seq).padStart(4, "0");
       const batch = { id: randomUUID(), code: batchCode, chemicalBatch, exposure, waterSource, plateSize, count, createdAt: now };
       const items = [];
       for (let n = 1; n <= count; n++) {
@@ -345,8 +347,8 @@ export class CyanotypeStore {
           createdAt: now,
         });
       }
-      this.db.batches.push(batch);
-      this.db.items.unshift(...items);
+      db.batches.push(batch);
+      db.items.unshift(...items);
       return { batch, items };
     });
   }
@@ -360,8 +362,8 @@ export class CyanotypeStore {
     if (expectedVersion !== undefined && !Number.isInteger(expectedVersion)) {
       fail(400, "invalid_input", "expectedVersion 必须是整数");
     }
-    return this._idempotent(idemKey, "transition", JSON.stringify({ itemRef, to, box, expectedVersion }), () => {
-      const item = this._findItem(itemRef);
+    return this._idempotent(idemKey, "transition", JSON.stringify({ itemRef, to, box, expectedVersion }), (db) => {
+      const item = this._findItem(db, itemRef);
       const idx = STAGES.indexOf(item.status);
       const next = STAGES[idx + 1];
       if (!next) fail(409, "invalid_transition", "底片已交付,不能再推进");
@@ -375,11 +377,11 @@ export class CyanotypeStore {
       }
       if (to === "待入盒") {
         if (!box) fail(400, "invalid_input", "入盒前必须指定盒位");
-        const holder = this.db.items.find(x => x.id !== item.id && x.box === box && x.status !== "已交付");
+        const holder = db.items.find(x => x.id !== item.id && x.box === box && x.status !== "已交付");
         if (holder) fail(409, "box_occupied", `盒位「${box}」已被未交付底片 ${holder.code} 占用`);
       }
       if (to === "已交付") {
-        const open = this.db.reviews.find(r => r.itemId === item.id && r.status === "未关闭");
+        const open = db.reviews.find(r => r.itemId === item.id && r.status === "未关闭");
         if (open) fail(409, "open_review", `存在未关闭复核工单 ${open.code},不能交付`);
       }
       const now = new Date().toISOString();
@@ -400,8 +402,8 @@ export class CyanotypeStore {
     const repair = optString(input.repair, 200);
     const note = optString(input.note, 300);
     const reexpose = input.reexpose === true || input.reexpose === "true" || input.reexpose === 1;
-    return this._idempotent(idemKey, "addStep", JSON.stringify({ itemRef, step, developStatus, defect, repair, note, reexpose }), () => {
-      const item = this._findItem(itemRef);
+    return this._idempotent(idemKey, "addStep", JSON.stringify({ itemRef, step, developStatus, defect, repair, note, reexpose }), (db) => {
+      const item = this._findItem(db, itemRef);
       if (item.status === "已交付") fail(409, "item_delivered", "底片已交付,不能再追加工艺记录");
       const now = new Date().toISOString();
       const record = { at: now, stage: item.status, step, developStatus, defect, repair, reexpose, note };
@@ -415,11 +417,11 @@ export class CyanotypeStore {
   }
 
   getItem(ref) {
-    return structuredClone(this._findItem(ref));
+    return structuredClone(this._findItem(this.db, ref));
   }
 
-  _findReview(ref) {
-    const review = this.db.reviews.find(r => r.id === ref || r.code === ref);
+  _findReview(db, ref) {
+    const review = db.reviews.find(r => r.id === ref || r.code === ref);
     if (!review) fail(404, "review_not_found", `找不到复核工单 ${ref}`);
     return review;
   }
@@ -430,19 +432,19 @@ export class CyanotypeStore {
     const conclusion = reqString(input.conclusion, "缺陷结论");
     const requirement = reqString(input.requirement, "整改要求");
     const deadline = parseDeadline(input.deadline);
-    return this._idempotent(idemKey, "createReview", JSON.stringify({ itemRef, reviewer, conclusion, requirement, deadline }), () => {
-      const item = this._findItem(itemRef);
+    return this._idempotent(idemKey, "createReview", JSON.stringify({ itemRef, reviewer, conclusion, requirement, deadline }), (db) => {
+      const item = this._findItem(db, itemRef);
       if (item.status !== "待入盒") {
         fail(409, "invalid_state", `底片当前状态为「${item.status}」,仅待入盒的底片可以发起复核`);
       }
       if (!item.box) fail(409, "invalid_state", "底片尚未指定盒位,无法发起复核");
-      const clash = this.db.reviews.find(r => r.status === "未关闭" && r.box === item.box);
+      const clash = db.reviews.find(r => r.status === "未关闭" && r.box === item.box);
       if (clash) fail(409, "box_review_exists", `盒位「${item.box}」已存在未关闭工单 ${clash.code}`);
       const now = new Date().toISOString();
-      this.db.reviewSeq += 1;
+      db.reviewSeq += 1;
       const review = {
         id: randomUUID(),
-        code: "RV-" + String(this.db.reviewSeq).padStart(4, "0"),
+        code: "RV-" + String(db.reviewSeq).padStart(4, "0"),
         itemId: item.id,
         itemCode: item.code,
         box: item.box,
@@ -456,7 +458,7 @@ export class CyanotypeStore {
         closedAt: "",
         version: 1,
       };
-      this.db.reviews.unshift(review);
+      db.reviews.unshift(review);
       item.logs.push({ at: now, step: "复核", note: `发起复核工单 ${review.code}(复核人:${reviewer})` });
       item.version += 1;
       return review;
@@ -470,8 +472,8 @@ export class CyanotypeStore {
     if (expectedVersion !== undefined && !Number.isInteger(expectedVersion)) {
       fail(400, "invalid_input", "expectedVersion 必须是整数");
     }
-    return this._idempotent(idemKey, "closeReview", JSON.stringify({ reviewRef, resolution, expectedVersion }), () => {
-      const review = this._findReview(reviewRef);
+    return this._idempotent(idemKey, "closeReview", JSON.stringify({ reviewRef, resolution, expectedVersion }), (db) => {
+      const review = this._findReview(db, reviewRef);
       if (review.status === "已关闭") fail(409, "invalid_state", `工单 ${review.code} 已关闭,请勿重复操作`);
       if (expectedVersion !== undefined && review.version !== expectedVersion) {
         fail(409, "version_conflict", `工单已被他人更新(当前版本 ${review.version}),请刷新后重试`);
@@ -481,7 +483,7 @@ export class CyanotypeStore {
       review.resolution = resolution;
       review.closedAt = now;
       review.version += 1;
-      const item = this.db.items.find(i => i.id === review.itemId);
+      const item = db.items.find(i => i.id === review.itemId);
       if (item) {
         item.logs.push({ at: now, step: "复核关闭", note: `${review.code}:${resolution}` });
         item.version += 1;
