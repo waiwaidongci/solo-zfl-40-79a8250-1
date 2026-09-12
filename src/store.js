@@ -63,14 +63,46 @@ function normalizeReview(raw, index) {
   };
 }
 
-// 截止时间:支持 YYYY-MM-DD(按当日结束计)或完整 ISO 时间
+// 截止时间:只接受真实存在的日历日期(YYYY-MM-DD,按当日结束计)或合法 ISO 时间。
+// 不能用 new Date() 直接判合法——它会把 2月31日 这类不存在的日期滚到相邻月份。
+const DATE_ONLY_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+const DATE_TIME_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,3})?)?(Z|[+-]\d{2}:\d{2})?$/;
+
+function isLeapYear(year) {
+  return (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+}
+
+function daysInMonth(year, month) {
+  return [31, isLeapYear(year) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+}
+
+function assertRealDate(year, month, day, raw) {
+  if (month < 1 || month > 12 || day < 1 || day > daysInMonth(year, month)) {
+    fail(400, "invalid_input", `截止时间「${raw}」不是真实存在的日历日期`);
+  }
+}
+
 function parseDeadline(value) {
   const v = reqString(value, "截止时间", 40);
-  const normalized = /^\d{4}-\d{2}-\d{2}$/.test(v) ? `${v}T23:59:59.999Z` : v;
-  if (Number.isNaN(new Date(normalized).getTime())) {
-    fail(400, "invalid_input", `截止时间「${v}」不是合法日期`);
+  const dateOnly = DATE_ONLY_RE.exec(v);
+  if (dateOnly) {
+    assertRealDate(Number(dateOnly[1]), Number(dateOnly[2]), Number(dateOnly[3]), v);
+    return `${v}T23:59:59.999Z`;
   }
-  return normalized;
+  const dateTime = DATE_TIME_RE.exec(v);
+  if (dateTime) {
+    assertRealDate(Number(dateTime[1]), Number(dateTime[2]), Number(dateTime[3]), v);
+    const [, , , , hour, minute, second = "0", zone] = dateTime;
+    if (Number(hour) > 23 || Number(minute) > 59 || Number(second) > 59) {
+      fail(400, "invalid_input", `截止时间「${v}」的时间部分不合法`);
+    }
+    if (zone && zone !== "Z") {
+      const [zh, zm] = zone.slice(1).split(":").map(Number);
+      if (zh > 23 || zm > 59) fail(400, "invalid_input", `截止时间「${v}」的时区偏移不合法`);
+    }
+    return v;
+  }
+  fail(400, "invalid_input", `截止时间「${v}」不是合法日期,请使用 YYYY-MM-DD 或 ISO 时间(如 2026-09-30T18:00:00Z)`);
 }
 
 function isOverdue(review, now) {

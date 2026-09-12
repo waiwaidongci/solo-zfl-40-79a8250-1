@@ -96,6 +96,25 @@ export function page() {
       clearTimeout(el._t);
       el._t = setTimeout(function(){ el.className = ""; }, 4000);
     }
+    // 与接口一致的截止时间校验:必须是真实存在的日历日期(含闰年规则)
+    function isRealDate(y, m, d) {
+      var leap = (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
+      var days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+      return m >= 1 && m <= 12 && d >= 1 && d <= days[m - 1];
+    }
+    function validDeadline(v) {
+      var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(v);
+      if (m) return isRealDate(+m[1], +m[2], +m[3]);
+      m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,3})?)?(Z|[+-]\d{2}:\d{2})?$/.exec(v);
+      if (!m) return false;
+      if (!isRealDate(+m[1], +m[2], +m[3])) return false;
+      if (+m[4] > 23 || +m[5] > 59 || (m[6] !== undefined && +m[6] > 59)) return false;
+      if (m[7] && m[7] !== "Z") {
+        var off = m[7].slice(1).split(":");
+        if (+off[0] > 23 || +off[1] > 59) return false;
+      }
+      return true;
+    }
     async function api(path, options) {
       var res = await fetch(path, options);
       var data = {};
@@ -299,6 +318,11 @@ export function page() {
       btn.disabled = true;
       var fd = new FormData(form);
       var payload = { reviewer: fd.get("reviewer"), conclusion: fd.get("conclusion"), requirement: fd.get("requirement"), deadline: fd.get("deadline") };
+      if (!validDeadline(payload.deadline || "")) {
+        toast("截止时间必须是真实存在的日历日期或合法时间", false);
+        btn.disabled = false;
+        return;
+      }
       try {
         var r = await jsonPost("/api/items/" + encodeURIComponent(id) + "/reviews", payload, reviewFormKey);
         toast("复核工单 " + r.code + " 已发起", true);

@@ -24,7 +24,7 @@ npm test           # node --test,自动发现 test/ 下全部用例(兼容新旧
 - **批次拆分**:`POST /api/batches` 传入 `chemicalBatch`、`exposure`、`waterSource`、`count`,一次创建 1-100 块底片,编号 `PC-0001-01` 起。
 - **状态机**:仅允许依次推进;入盒(`待入盒`)必须指定盒位;同一盒位不能同时存放两块未交付底片,交付后盒位自动释放。
 - **工艺步骤**:`POST /api/items/:id/steps` 记录步骤,复晒(`reexpose`)、缺陷、修补均关联到具体步骤与当时状态;已交付底片拒绝追加。
-- **复核工单**:底片进入 `待入盒` 后可发起复核(`POST /api/items/:id/reviews`),记录复核人、缺陷结论、整改要求、截止时间;存在未关闭工单时底片不能交付;同一盒位任一时刻只能有一张未关闭工单;关闭工单(`POST /api/reviews/:id/close`)必须填写处理结果;逾期工单在列表(`overdue` 标记)与统计(`reviews.overdue`)中单独标出。
+- **复核工单**:底片进入 `待入盒` 后可发起复核(`POST /api/items/:id/reviews`),记录复核人、缺陷结论、整改要求、截止时间;存在未关闭工单时底片不能交付;同一盒位任一时刻只能有一张未关闭工单;关闭工单(`POST /api/reviews/:id/close`)必须填写处理结果;逾期工单在列表(`overdue` 标记)与统计(`reviews.overdue`)中单独标出。截止时间只接受真实存在的日历日期(`YYYY-MM-DD`,按当日结束计)或合法 ISO 时间,不存在的日期(如 2026-02-31)与时间会被 400 拒绝,不会滚入相邻月份。
 - **幂等**:写操作支持 `Idempotency-Key` 请求头(或 `requestId` 字段),重复提交返回首次结果(`X-Idempotent-Replay: true`),不产生重复记录;同键不同内容返回 409。
 - **并发**:更新可携带 `expectedVersion` 做乐观锁,版本不匹配返回 409;并发推进/抢占盒位/发起或关闭工单只有一个请求成功。
 - **筛选与统计**:`GET /api/items?status=&batch=&box=&defect=&q=`,`GET /api/reviews?status=&box=&item=&overdue=`,`GET /api/stats` 实时从当前记录计算。
