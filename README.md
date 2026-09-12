@@ -1,9 +1,42 @@
-# 古法蓝晒底片整理室
+# 古法蓝晒底片批次工作台
 
-运行：
+一次曝光拆分为多块底片,记录药液批次、曝光时间与冲洗水源;底片按
+`待曝光 → 冲洗中 → 待入盒 → 已交付` 依次推进,退回与跳步一律拒绝。
+
+## 运行
 
 ```bash
-npm start
+npm start          # http://localhost:3040
 ```
 
-访问`http://localhost:3040`。数据保存在`data/cyanotype-negative-room.json`。
+数据保存在 `data/cyanotype-negative-room.json`(原子写盘,重启后自动恢复,旧格式数据自动迁移)。
+
+## 测试
+
+```bash
+npm test           # node:test,覆盖状态机、盒位冲突、幂等重放、重启恢复、异常输入与并发更新
+```
+
+## 业务规则
+
+- **批次拆分**:`POST /api/batches` 传入 `chemicalBatch`、`exposure`、`waterSource`、`count`,一次创建 1-100 块底片,编号 `PC-0001-01` 起。
+- **状态机**:仅允许依次推进;入盒(`待入盒`)必须指定盒位;同一盒位不能同时存放两块未交付底片,交付后盒位自动释放。
+- **工艺步骤**:`POST /api/items/:id/steps` 记录步骤,复晒(`reexpose`)、缺陷、修补均关联到具体步骤与当时状态;已交付底片拒绝追加。
+- **幂等**:写操作支持 `Idempotency-Key` 请求头(或 `requestId` 字段),重复提交返回首次结果(`X-Idempotent-Replay: true`),不产生重复记录;同键不同内容返回 409。
+- **并发**:更新可携带 `expectedVersion` 做乐观锁,版本不匹配返回 409;并发推进/抢占盒位只有一个请求成功。
+- **筛选与统计**:`GET /api/items?status=&batch=&box=&defect=&q=`,`GET /api/stats` 实时从当前记录计算。
+
+## 接口一览
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/` | 工作台页面 |
+| POST | `/api/batches` | 创建曝光批次并拆分底片 |
+| GET | `/api/batches` | 批次列表 |
+| GET | `/api/items` | 底片列表(支持筛选) |
+| GET | `/api/items/:id` | 单块底片详情 |
+| POST | `/api/items/:id/transition` | 状态推进 `{ to, box?, expectedVersion? }` |
+| POST | `/api/items/:id/steps` | 记录工艺步骤 `{ step, developStatus?, defect?, repair?, reexpose?, note? }` |
+| GET | `/api/stats` | 状态/缺陷/复晒统计 |
+
+错误统一返回 `{ "error": 错误码, "message": 描述 }`,状态码语义:400 输入非法 / 404 不存在 / 405 方法不允许 / 409 业务冲突(跳步、退回、盒位占用、版本冲突、幂等键重用)/ 413 请求体过大。
